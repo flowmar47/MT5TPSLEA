@@ -1,0 +1,18 @@
+# MetaTrader / MQL5 compiled & runtime files
+*.ex5
+*.ex4
+*.log
+*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+
+# macOS / Editors
+.DS_Store
+.vscode/
+.idea/

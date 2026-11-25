@@ -1,0 +1,32 @@
+; XAGUSD Trailing TP/SL EA v2.00 - Conservative Preset
+; Wider trailing stops, stricter ADX trend filter, capped TP extensions, and spread guard
+InpSymbol=
+InpMagicNumber=0
+InpCheckIntervalMs=500
+InpPipSizeOverride=0.0
+InpMaxSpreadPips=5.0
+InpShowDashboard=true
+InpPersistState=true
+InpApplyInitialSLTP=true
+InpInitialSLPips=40.0
+InpInitialTPPips=80.0
+InpEnableTrailingSL=true
+InpTrailingSLStart=25.0
+InpTrailingSLDistance=25.0
+InpTrailingSLStep=5.0
+InpUseATRForSL=true
+InpEnableTrailingTP=true
+InpTPExtendThreshold=40.0
+InpTPExtendAmount=15.0
+InpMaxTPExtensions=3
+InpUseATRForTP=true
+InpUseTrendFilter=true
+InpADXPeriod=14
+InpADXThreshold=30.0
+InpStrongTrendADX=40.0
+InpATRPeriod=14
+InpATRMultiplierSL=2.0
+InpATRMultiplierTP=2.0
+InpBreakEvenPips=25.0
+InpBreakEvenOffset=3.0
+InpEnableBreakEven=true

@@ -1,0 +1,32 @@
+; XAGUSD Trailing TP/SL EA v2.00 - Default Preset
+; Balanced settings for manual XAGUSD trades (auto-detects chart symbol & broker suffix)
+InpSymbol=
+InpMagicNumber=0
+InpCheckIntervalMs=500
+InpPipSizeOverride=0.0
+InpMaxSpreadPips=0.0
+InpShowDashboard=true
+InpPersistState=true
+InpApplyInitialSLTP=true
+InpInitialSLPips=50.0
+InpInitialTPPips=100.0
+InpEnableTrailingSL=true
+InpTrailingSLStart=20.0
+InpTrailingSLDistance=15.0
+InpTrailingSLStep=5.0
+InpUseATRForSL=true
+InpEnableTrailingTP=true
+InpTPExtendThreshold=30.0
+InpTPExtendAmount=20.0
+InpMaxTPExtensions=5
+InpUseATRForTP=true
+InpUseTrendFilter=true
+InpADXPeriod=14
+InpADXThreshold=25.0
+InpStrongTrendADX=35.0
+InpATRPeriod=14
+InpATRMultiplierSL=1.5
+InpATRMultiplierTP=2.5
+InpBreakEvenPips=30.0
+InpBreakEvenOffset=2.0
+InpEnableBreakEven=true

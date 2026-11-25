@@ -1,25 +1,28 @@
 //+------------------------------------------------------------------+
-//|                                         XAGUSD_TrailingTPSL.mq5 |
+//|                                         XAGUSD_TrailingTPSL.mq5  |
 //|                        Trailing TP/SL EA for Manual XAGUSD Trades|
 //|                                                                  |
-//| Automatically applies and trails Take Profit and Stop Loss      |
-//| on manually entered XAGUSD positions based on trend strength    |
+//| Automatically applies and trails Take Profit and Stop Loss       |
+//| on manually entered XAGUSD positions based on trend strength     |
 //+------------------------------------------------------------------+
-#property copyright "2024"
-#property link      ""
-#property version   "1.00"
+#property copyright "2024-2026 flowmar47"
+#property link      "https://github.com/flowmar47/MT5TPSLEA"
+#property version   "2.00"
 #property strict
 
 #include <Trade/Trade.mqh>
-#include <Trade/PositionInfo.mqh>
 
 //+------------------------------------------------------------------+
 //| Input Parameters                                                  |
 //+------------------------------------------------------------------+
 input group "=== General Settings ==="
-input string   InpSymbol              = "XAGUSD";     // Symbol to monitor
+input string   InpSymbol              = "";           // Symbol to monitor (empty = current chart symbol)
 input int      InpMagicNumber         = 0;            // Magic number (0 = all manual trades)
 input int      InpCheckIntervalMs     = 500;          // Check interval in milliseconds
+input double   InpPipSizeOverride     = 0.0;          // Pip size override (0 = auto-detect)
+input double   InpMaxSpreadPips       = 0.0;          // Max spread filter in pips (0 = disabled)
+input bool     InpShowDashboard       = true;         // Show chart dashboard
+input bool     InpPersistState        = true;         // Persist BE/TP state across restarts
 
 input group "=== Initial SL/TP Settings ==="
 input bool     InpApplyInitialSLTP    = true;         // Apply initial SL/TP if not set
@@ -37,7 +40,7 @@ input group "=== Trailing Take Profit Settings ==="
 input bool     InpEnableTrailingTP    = true;         // Enable Trailing Take Profit
 input double   InpTPExtendThreshold   = 30.0;         // Extend TP after X pips in profit
 input double   InpTPExtendAmount      = 20.0;         // Amount to extend TP (pips)
-input double   InpMaxTPExtensions     = 5;            // Maximum TP extensions allowed
+input int      InpMaxTPExtensions     = 5;            // Maximum TP extensions allowed
 input bool     InpUseATRForTP         = true;         // Use ATR for dynamic TP extension
 
 input group "=== Trend Detection Settings (ADX) ==="
@@ -60,10 +63,9 @@ input bool     InpEnableBreakEven     = true;         // Enable breakeven featur
 //| Global Variables                                                  |
 //+------------------------------------------------------------------+
 CTrade         trade;
-CPositionInfo  positionInfo;
 
-int            adxHandle;
-int            atrHandle;
+int            adxHandle = INVALID_HANDLE;
+int            atrHandle = INVALID_HANDLE;
 double         adxBuffer[];
 double         plusDIBuffer[];
 double         minusDIBuffer[];
@@ -74,52 +76,227 @@ struct PositionData
    ulong    ticket;
    double   entryPrice;
    double   initialTP;
+   double   lastExtendedTP;
    int      tpExtensions;
    bool     breakEvenSet;
    datetime openTime;
 };
 
 PositionData   trackedPositions[];
-double         pipValue;
+string         workSymbol;
 double         pipSize;
 int            digits;
+
+//+------------------------------------------------------------------+
+//| Global variable key helpers for restart persistence               |
+//+------------------------------------------------------------------+
+string GetBEGlobalVarName(ulong ticket)
+{
+   return "TTPSL_BE_" + IntegerToString(ticket);
+}
+
+string GetExtGlobalVarName(ulong ticket)
+{
+   return "TTPSL_EXT_" + IntegerToString(ticket);
+}
+
+//+------------------------------------------------------------------+
+//| Price and stop-distance helpers                                   |
+//+------------------------------------------------------------------+
+double NormalizePrice(double price)
+{
+   if(price <= 0.0)
+      return 0.0;
+
+   double tickSize = SymbolInfoDouble(workSymbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize > 0.0)
+      price = MathRound(price / tickSize) * tickSize;
+
+   return NormalizeDouble(price, digits);
+}
+
+double GetMinStopDistance()
+{
+   long stopsLevel  = SymbolInfoInteger(workSymbol, SYMBOL_TRADE_STOPS_LEVEL);
+   long freezeLevel = SymbolInfoInteger(workSymbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   double point     = SymbolInfoDouble(workSymbol, SYMBOL_POINT);
+   return (double)MathMax(stopsLevel, freezeLevel) * point;
+}
+
+bool IsModifyRetcodeSuccess(uint retcode)
+{
+   return (retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_DONE_PARTIAL);
+}
+
+bool IsModifySafe(ENUM_POSITION_TYPE posType, double bid, double ask,
+                  double currentSL, double currentTP, double newSL, double newTP)
+{
+   if(bid <= 0.0 || ask <= 0.0)
+      return false;
+
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+   {
+      Print("Modify blocked: Terminal trading is disabled");
+      return false;
+   }
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
+   {
+      Print("Modify blocked: EA automated trading is disabled");
+      return false;
+   }
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
+   {
+      Print("Modify blocked: Account trading is disabled");
+      return false;
+   }
+   if(SymbolInfoInteger(workSymbol, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_DISABLED)
+   {
+      Print("Modify blocked: Trading disabled for symbol ", workSymbol);
+      return false;
+   }
+
+   if(InpMaxSpreadPips > 0.0)
+   {
+      double spreadPips = (ask - bid) / pipSize;
+      if(spreadPips > InpMaxSpreadPips)
+      {
+         return false;
+      }
+   }
+
+   double point      = SymbolInfoDouble(workSymbol, SYMBOL_POINT);
+   long freezeLevel  = SymbolInfoInteger(workSymbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   double freezeDist = (double)freezeLevel * point;
+   double refPrice   = (posType == POSITION_TYPE_BUY) ? bid : ask;
+
+   if(freezeDist > 0.0)
+   {
+      if(currentSL > 0.0 && MathAbs(refPrice - currentSL) <= freezeDist)
+         return false;
+      if(currentTP > 0.0 && MathAbs(refPrice - currentTP) <= freezeDist)
+         return false;
+   }
+
+   double minStopDist = GetMinStopDistance();
+   double eps         = point * 0.01;
+
+   if(posType == POSITION_TYPE_BUY)
+   {
+      if(newSL > 0.0 && (newSL >= bid || (bid - newSL) + eps < minStopDist))
+         return false;
+      if(newTP > 0.0 && (newTP <= bid || (newTP - bid) + eps < minStopDist))
+         return false;
+   }
+   else
+   {
+      if(newSL > 0.0 && (newSL <= ask || (newSL - ask) + eps < minStopDist))
+         return false;
+      if(newTP > 0.0 && (newTP >= ask || (ask - newTP) + eps < minStopDist))
+         return false;
+   }
+
+   return true;
+}
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   // Validate symbol
-   if(!SymbolSelect(InpSymbol, true))
+   // Validate input parameters
+   if(InpCheckIntervalMs < 100)
    {
-      Print("Error: Symbol ", InpSymbol, " not found!");
+      Print("Error: InpCheckIntervalMs must be >= 100 ms");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(InpADXPeriod < 2)
+   {
+      Print("Error: InpADXPeriod must be >= 2");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(InpATRPeriod < 2)
+   {
+      Print("Error: InpATRPeriod must be >= 2");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(InpInitialSLPips < 0.0 || InpInitialTPPips < 0.0 ||
+      InpTrailingSLStart < 0.0 || InpTrailingSLDistance < 0.0 || InpTrailingSLStep < 0.0 ||
+      InpTPExtendThreshold < 0.0 || InpTPExtendAmount < 0.0 ||
+      InpATRMultiplierSL < 0.0 || InpATRMultiplierTP < 0.0 ||
+      InpBreakEvenPips < 0.0 || InpBreakEvenOffset < 0.0 ||
+      InpPipSizeOverride < 0.0 || InpMaxSpreadPips < 0.0)
+   {
+      Print("Error: Pip, multiplier, spread, and override inputs must be non-negative");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(InpADXThreshold < 0.0 || InpStrongTrendADX < InpADXThreshold)
+   {
+      Print("Error: InpADXThreshold must be >= 0 and InpStrongTrendADX >= InpADXThreshold");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(InpMaxTPExtensions < 0)
+   {
+      Print("Error: InpMaxTPExtensions must be >= 0");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   // Resolve working symbol (supports broker suffixes automatically when InpSymbol == "")
+   string trimmedSymbol = InpSymbol;
+   StringTrimLeft(trimmedSymbol);
+   StringTrimRight(trimmedSymbol);
+   workSymbol = (trimmedSymbol == "") ? _Symbol : trimmedSymbol;
+
+   // Validate symbol
+   if(!SymbolSelect(workSymbol, true))
+   {
+      Print("Error: Symbol ", workSymbol, " not found!");
       return INIT_FAILED;
    }
 
    // Get symbol properties
-   digits = (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS);
+   digits = (int)SymbolInfoInteger(workSymbol, SYMBOL_DIGITS);
+   double point = SymbolInfoDouble(workSymbol, SYMBOL_POINT);
 
-   // Calculate pip size for XAGUSD (typically 0.01 for silver)
-   if(digits == 3)
-      pipSize = 0.01;
-   else if(digits == 2)
-      pipSize = 0.01;
-   else if(digits == 5)
-      pipSize = 0.0001;
+   // Calculate pip size (override or auto-detect from digits/point)
+   if(InpPipSizeOverride > 0.0)
+   {
+      pipSize = InpPipSizeOverride;
+   }
    else
-      pipSize = SymbolInfoDouble(InpSymbol, SYMBOL_POINT) * 10;
+   {
+      if(digits == 3 || digits == 2)
+         pipSize = 0.01;
+      else if(digits == 5 || digits == 4)
+         pipSize = 0.0001;
+      else
+         pipSize = point * 10.0;
+   }
 
-   pipValue = pipSize;
+   if(pipSize <= 0.0 || point <= 0.0)
+   {
+      Print("Error: Invalid pip size (", pipSize, ") or point (", point, ") for ", workSymbol);
+      return INIT_PARAMETERS_INCORRECT;
+   }
 
-   Print("Initialized for ", InpSymbol, " | Digits: ", digits, " | Pip Size: ", pipSize);
+   Print("Initialized for ", workSymbol, " | Digits: ", digits, " | Pip Size: ", pipSize);
 
    // Initialize indicators
-   adxHandle = iADX(InpSymbol, PERIOD_CURRENT, InpADXPeriod);
-   atrHandle = iATR(InpSymbol, PERIOD_CURRENT, InpATRPeriod);
+   adxHandle = iADX(workSymbol, PERIOD_CURRENT, InpADXPeriod);
+   atrHandle = iATR(workSymbol, PERIOD_CURRENT, InpATRPeriod);
 
    if(adxHandle == INVALID_HANDLE || atrHandle == INVALID_HANDLE)
    {
-      Print("Error creating indicators!");
+      Print("Error creating indicators for ", workSymbol, " | Error: ", GetLastError());
+      if(adxHandle != INVALID_HANDLE)
+      {
+         IndicatorRelease(adxHandle);
+         adxHandle = INVALID_HANDLE;
+      }
+      if(atrHandle != INVALID_HANDLE)
+      {
+         IndicatorRelease(atrHandle);
+         atrHandle = INVALID_HANDLE;
+      }
       return INIT_FAILED;
    }
 
@@ -129,21 +306,31 @@ int OnInit()
    ArraySetAsSeries(minusDIBuffer, true);
    ArraySetAsSeries(atrBuffer, true);
 
-   // Set up trade object
+   // Set up trade object with auto-detected broker filling mode
    trade.SetExpertMagicNumber(InpMagicNumber);
    trade.SetDeviationInPoints(10);
-   trade.SetTypeFilling(ORDER_FILLING_IOC);
+
+   long fillingMode = SymbolInfoInteger(workSymbol, SYMBOL_FILLING_MODE);
+   if((fillingMode & SYMBOL_FILLING_IOC) != 0)
+      trade.SetTypeFilling(ORDER_FILLING_IOC);
+   else if((fillingMode & SYMBOL_FILLING_FOK) != 0)
+      trade.SetTypeFilling(ORDER_FILLING_FOK);
+   else
+      trade.SetTypeFilling(ORDER_FILLING_RETURN);
+
+   if(!InpShowDashboard)
+      ObjectsDeleteAll(0, "TTPSL_");
 
    // Set timer for regular checks
    EventSetMillisecondTimer(InpCheckIntervalMs);
 
    Print("==============================================");
-   Print("XAGUSD Trailing TP/SL EA Initialized");
-   Print("Monitoring symbol: ", InpSymbol);
-   Print("Leverage: 500x (High leverage mode)");
+   Print("XAGUSD Trailing TP/SL EA v2.00 Initialized");
+   Print("Monitoring symbol: ", workSymbol);
    Print("Trailing SL: ", InpEnableTrailingSL ? "Enabled" : "Disabled");
    Print("Trailing TP: ", InpEnableTrailingTP ? "Enabled" : "Disabled");
    Print("Trend Filter: ", InpUseTrendFilter ? "Enabled" : "Disabled");
+   Print("State Persistence: ", InpPersistState ? "Enabled" : "Disabled");
    Print("==============================================");
 
    return INIT_SUCCEEDED;
@@ -157,11 +344,19 @@ void OnDeinit(const int reason)
    EventKillTimer();
 
    if(adxHandle != INVALID_HANDLE)
+   {
       IndicatorRelease(adxHandle);
+      adxHandle = INVALID_HANDLE;
+   }
    if(atrHandle != INVALID_HANDLE)
+   {
       IndicatorRelease(atrHandle);
+      atrHandle = INVALID_HANDLE;
+   }
 
-   Print("XAGUSD Trailing TP/SL EA Deinitialized");
+   ObjectsDeleteAll(0, "TTPSL_");
+
+   Print("XAGUSD Trailing TP/SL EA v2.00 Deinitialized");
 }
 
 //+------------------------------------------------------------------+
@@ -199,7 +394,7 @@ void ProcessPositions()
 
       // Check if position is for our symbol
       string symbol = PositionGetString(POSITION_SYMBOL);
-      if(symbol != InpSymbol) continue;
+      if(symbol != workSymbol) continue;
 
       // Check magic number (0 = all manual trades)
       long magic = PositionGetInteger(POSITION_MAGIC);
@@ -211,6 +406,10 @@ void ProcessPositions()
 
    // Clean up tracked positions that no longer exist
    CleanupTrackedPositions();
+
+   // Update chart dashboard
+   if(InpShowDashboard)
+      DisplayDashboard();
 }
 
 //+------------------------------------------------------------------+
@@ -225,15 +424,17 @@ void ProcessSinglePosition(ulong ticket)
    double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
    double currentSL = PositionGetDouble(POSITION_SL);
    double currentTP = PositionGetDouble(POSITION_TP);
-   double volume = PositionGetDouble(POSITION_VOLUME);
    datetime openTime = (datetime)PositionGetInteger(POSITION_TIME);
 
-   double bid = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
-   double ask = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(workSymbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(workSymbol, SYMBOL_ASK);
+   if(bid <= 0.0 || ask <= 0.0)
+      return;
+
    double currentPrice = (posType == POSITION_TYPE_BUY) ? bid : ask;
 
    // Calculate profit in pips
-   double profitPips = 0;
+   double profitPips = 0.0;
    if(posType == POSITION_TYPE_BUY)
       profitPips = (currentPrice - entryPrice) / pipSize;
    else
@@ -260,7 +461,7 @@ void ProcessSinglePosition(ulong ticket)
    // Apply initial SL/TP if not set
    if(InpApplyInitialSLTP)
    {
-      ApplyInitialSLTP(ticket, posType, entryPrice, currentSL, currentTP, atrValue);
+      ApplyInitialSLTP(ticket, posType, entryPrice, currentSL, currentTP, atrValue, bid, ask);
    }
 
    // Refresh position data after potential modification
@@ -269,13 +470,26 @@ void ProcessSinglePosition(ulong ticket)
    currentSL = PositionGetDouble(POSITION_SL);
    currentTP = PositionGetDouble(POSITION_TP);
 
-   // Break-even logic
+   if(trackedPositions[trackIndex].initialTP == 0.0 && currentTP > 0.0)
+   {
+      trackedPositions[trackIndex].initialTP = currentTP;
+      trackedPositions[trackIndex].lastExtendedTP = currentTP;
+   }
+
+   // Break-even logic (only mark breakEvenSet when ApplyBreakEven confirms success)
    if(InpEnableBreakEven && !trackedPositions[trackIndex].breakEvenSet)
    {
       if(profitPips >= InpBreakEvenPips)
       {
-         ApplyBreakEven(ticket, posType, entryPrice, currentSL);
-         trackedPositions[trackIndex].breakEvenSet = true;
+         if(ApplyBreakEven(ticket, posType, entryPrice, currentSL, currentTP, bid, ask))
+         {
+            trackedPositions[trackIndex].breakEvenSet = true;
+            if(InpPersistState)
+               GlobalVariableSet(GetBEGlobalVarName(ticket), 1.0);
+
+            if(PositionSelectByTicket(ticket))
+               currentSL = PositionGetDouble(POSITION_SL);
+         }
       }
    }
 
@@ -285,9 +499,15 @@ void ProcessSinglePosition(ulong ticket)
       // Check trend filter
       if(!InpUseTrendFilter || (isStrongTrend && trendMatchesPosition))
       {
-         ApplyTrailingStopLoss(ticket, posType, currentPrice, currentSL, atrValue, isVeryStrongTrend);
+         ApplyTrailingStopLoss(ticket, posType, currentPrice, currentSL, currentTP, atrValue, isVeryStrongTrend, bid, ask);
       }
    }
+
+   // Refresh SL/TP before trailing TP
+   if(!PositionSelectByTicket(ticket))
+      return;
+   currentSL = PositionGetDouble(POSITION_SL);
+   currentTP = PositionGetDouble(POSITION_TP);
 
    // Trailing Take Profit
    if(InpEnableTrailingTP && profitPips >= InpTPExtendThreshold)
@@ -297,11 +517,16 @@ void ProcessSinglePosition(ulong ticket)
       {
          if(trackedPositions[trackIndex].tpExtensions < InpMaxTPExtensions)
          {
-            if(ExtendTakeProfit(ticket, posType, currentPrice, currentTP, atrValue, isVeryStrongTrend))
+            double extendedTP = currentTP;
+            if(ExtendTakeProfit(ticket, posType, currentPrice, currentSL, currentTP, atrValue, isVeryStrongTrend, bid, ask, extendedTP))
             {
                trackedPositions[trackIndex].tpExtensions++;
-               trackedPositions[trackIndex].initialTP = currentTP;
-               Print("TP Extended for ticket ", ticket, " | Extensions: ", trackedPositions[trackIndex].tpExtensions);
+               trackedPositions[trackIndex].lastExtendedTP = extendedTP;
+               if(InpPersistState)
+                  GlobalVariableSet(GetExtGlobalVarName(ticket), (double)trackedPositions[trackIndex].tpExtensions);
+
+               Print("TP Extended for ticket ", ticket, " | Extensions: ", trackedPositions[trackIndex].tpExtensions,
+                     " | InitialTP: ", trackedPositions[trackIndex].initialTP, " | LastTP: ", extendedTP);
             }
          }
       }
@@ -312,7 +537,8 @@ void ProcessSinglePosition(ulong ticket)
 //| Apply initial SL/TP if not set                                    |
 //+------------------------------------------------------------------+
 void ApplyInitialSLTP(ulong ticket, ENUM_POSITION_TYPE posType, double entryPrice,
-                      double currentSL, double currentTP, double atrValue)
+                      double currentSL, double currentTP, double atrValue,
+                      double bid, double ask)
 {
    double newSL = currentSL;
    double newTP = currentTP;
@@ -330,76 +556,90 @@ void ApplyInitialSLTP(ulong ticket, ENUM_POSITION_TYPE posType, double entryPric
 
    if(posType == POSITION_TYPE_BUY)
    {
-      if(currentSL == 0 || currentSL < 0.0001)
+      if(currentSL <= 0.0 && slDistance > 0.0)
       {
-         newSL = NormalizeDouble(entryPrice - slDistance, digits);
+         newSL = NormalizePrice(entryPrice - slDistance);
          needsModify = true;
       }
-      if(currentTP == 0 || currentTP < 0.0001)
+      if(currentTP <= 0.0 && tpDistance > 0.0)
       {
-         newTP = NormalizeDouble(entryPrice + tpDistance, digits);
+         newTP = NormalizePrice(entryPrice + tpDistance);
          needsModify = true;
       }
    }
    else // SELL
    {
-      if(currentSL == 0 || currentSL < 0.0001)
+      if(currentSL <= 0.0 && slDistance > 0.0)
       {
-         newSL = NormalizeDouble(entryPrice + slDistance, digits);
+         newSL = NormalizePrice(entryPrice + slDistance);
          needsModify = true;
       }
-      if(currentTP == 0 || currentTP < 0.0001)
+      if(currentTP <= 0.0 && tpDistance > 0.0)
       {
-         newTP = NormalizeDouble(entryPrice - tpDistance, digits);
+         newTP = NormalizePrice(entryPrice - tpDistance);
          needsModify = true;
       }
    }
 
-   if(needsModify)
+   if(!needsModify)
+      return;
+
+   if(!IsModifySafe(posType, bid, ask, currentSL, currentTP, newSL, newTP))
+      return;
+
+   if(trade.PositionModify(ticket, newSL, newTP) && IsModifyRetcodeSuccess(trade.ResultRetcode()))
    {
-      if(trade.PositionModify(ticket, newSL, newTP))
-      {
-         Print("Initial SL/TP applied to ticket ", ticket, " | SL: ", newSL, " | TP: ", newTP);
-      }
-      else
-      {
-         Print("Failed to apply initial SL/TP to ticket ", ticket, " | Error: ", GetLastError());
-      }
+      Print("Initial SL/TP applied to ticket ", ticket, " | SL: ", newSL, " | TP: ", newTP);
+   }
+   else
+   {
+      Print("Failed to apply initial SL/TP to ticket ", ticket,
+            " | Retcode: ", trade.ResultRetcode(), " (", trade.ResultRetcodeDescription(), ")");
    }
 }
 
 //+------------------------------------------------------------------+
 //| Apply break-even stop loss                                        |
 //+------------------------------------------------------------------+
-void ApplyBreakEven(ulong ticket, ENUM_POSITION_TYPE posType, double entryPrice, double currentSL)
+bool ApplyBreakEven(ulong ticket, ENUM_POSITION_TYPE posType, double entryPrice,
+                    double currentSL, double currentTP, double bid, double ask)
 {
    double newSL;
    double offset = InpBreakEvenOffset * pipSize;
 
    if(posType == POSITION_TYPE_BUY)
    {
-      newSL = NormalizeDouble(entryPrice + offset, digits);
-      if(currentSL >= newSL) return; // Already at or above breakeven
+      newSL = NormalizePrice(entryPrice + offset);
+      if(currentSL >= newSL)
+         return true; // Already at or above breakeven
    }
    else
    {
-      newSL = NormalizeDouble(entryPrice - offset, digits);
-      if(currentSL != 0 && currentSL <= newSL) return; // Already at or below breakeven
+      newSL = NormalizePrice(entryPrice - offset);
+      if(currentSL != 0.0 && currentSL <= newSL)
+         return true; // Already at or below breakeven
    }
 
-   double currentTP = PositionGetDouble(POSITION_TP);
+   if(!IsModifySafe(posType, bid, ask, currentSL, currentTP, newSL, currentTP))
+      return false;
 
-   if(trade.PositionModify(ticket, newSL, currentTP))
+   if(trade.PositionModify(ticket, newSL, currentTP) && IsModifyRetcodeSuccess(trade.ResultRetcode()))
    {
       Print("Break-even applied to ticket ", ticket, " | New SL: ", newSL);
+      return true;
    }
+
+   Print("Failed to apply break-even to ticket ", ticket,
+         " | Retcode: ", trade.ResultRetcode(), " (", trade.ResultRetcodeDescription(), ")");
+   return false;
 }
 
 //+------------------------------------------------------------------+
 //| Apply trailing stop loss                                          |
 //+------------------------------------------------------------------+
 void ApplyTrailingStopLoss(ulong ticket, ENUM_POSITION_TYPE posType, double currentPrice,
-                           double currentSL, double atrValue, bool isVeryStrongTrend)
+                           double currentSL, double currentTP, double atrValue,
+                           bool isVeryStrongTrend, double bid, double ask)
 {
    // Calculate trailing distance
    double trailDistance = InpTrailingSLDistance * pipSize;
@@ -413,35 +653,48 @@ void ApplyTrailingStopLoss(ulong ticket, ENUM_POSITION_TYPE posType, double curr
       trailDistance = MathMax(trailDistance * 0.5, atrDistance);
    }
 
+   if(trailDistance <= 0.0)
+      return;
+
    double minStep = InpTrailingSLStep * pipSize;
    double newSL;
 
    if(posType == POSITION_TYPE_BUY)
    {
-      newSL = NormalizeDouble(currentPrice - trailDistance, digits);
+      newSL = NormalizePrice(currentPrice - trailDistance);
+      if(newSL <= 0.0)
+         return;
 
-      // Only move SL up, never down
-      if(currentSL == 0 || newSL <= currentSL) return;
+      // Only move SL up, never down (allow setting initial trailing SL when currentSL == 0)
+      if(currentSL != 0.0 && newSL <= currentSL) return;
 
-      // Check minimum step
-      if((newSL - currentSL) < minStep) return;
+      // Check minimum step when SL is already set
+      if(currentSL != 0.0 && (newSL - currentSL) < minStep) return;
    }
    else // SELL
    {
-      newSL = NormalizeDouble(currentPrice + trailDistance, digits);
+      newSL = NormalizePrice(currentPrice + trailDistance);
+      if(newSL <= 0.0)
+         return;
 
       // Only move SL down, never up
-      if(currentSL != 0 && newSL >= currentSL) return;
+      if(currentSL != 0.0 && newSL >= currentSL) return;
 
-      // Check minimum step
-      if(currentSL != 0 && (currentSL - newSL) < minStep) return;
+      // Check minimum step when SL is already set
+      if(currentSL != 0.0 && (currentSL - newSL) < minStep) return;
    }
 
-   double currentTP = PositionGetDouble(POSITION_TP);
+   if(!IsModifySafe(posType, bid, ask, currentSL, currentTP, newSL, currentTP))
+      return;
 
-   if(trade.PositionModify(ticket, newSL, currentTP))
+   if(trade.PositionModify(ticket, newSL, currentTP) && IsModifyRetcodeSuccess(trade.ResultRetcode()))
    {
-      Print("Trailing SL updated for ticket ", ticket, " | New SL: ", newSL, " | Distance: ", trailDistance/pipSize, " pips");
+      Print("Trailing SL updated for ticket ", ticket, " | New SL: ", newSL, " | Distance: ", trailDistance / pipSize, " pips");
+   }
+   else
+   {
+      Print("Failed to update trailing SL for ticket ", ticket,
+            " | Retcode: ", trade.ResultRetcode(), " (", trade.ResultRetcodeDescription(), ")");
    }
 }
 
@@ -449,9 +702,11 @@ void ApplyTrailingStopLoss(ulong ticket, ENUM_POSITION_TYPE posType, double curr
 //| Extend take profit in strong trends                               |
 //+------------------------------------------------------------------+
 bool ExtendTakeProfit(ulong ticket, ENUM_POSITION_TYPE posType, double currentPrice,
-                      double currentTP, double atrValue, bool isVeryStrongTrend)
+                      double currentSL, double currentTP, double atrValue,
+                      bool isVeryStrongTrend, double bid, double ask, double &outNewTP)
 {
-   if(currentTP == 0) return false;
+   if(currentTP <= 0.0)
+      return false;
 
    // Calculate extension amount
    double extendAmount = InpTPExtendAmount * pipSize;
@@ -465,6 +720,9 @@ bool ExtendTakeProfit(ulong ticket, ENUM_POSITION_TYPE posType, double currentPr
       extendAmount = MathMax(extendAmount, atrExtend);
    }
 
+   if(extendAmount <= 0.0)
+      return false;
+
    double newTP;
    double distanceToTP;
 
@@ -472,27 +730,35 @@ bool ExtendTakeProfit(ulong ticket, ENUM_POSITION_TYPE posType, double currentPr
    {
       distanceToTP = currentTP - currentPrice;
       // Only extend if price is getting close to TP (within 50% of extension amount)
-      if(distanceToTP > extendAmount * 0.5) return false;
+      if(distanceToTP > extendAmount * 0.5)
+         return false;
 
-      newTP = NormalizeDouble(currentTP + extendAmount, digits);
+      newTP = NormalizePrice(currentTP + extendAmount);
    }
    else // SELL
    {
       distanceToTP = currentPrice - currentTP;
       // Only extend if price is getting close to TP
-      if(distanceToTP > extendAmount * 0.5) return false;
+      if(distanceToTP > extendAmount * 0.5)
+         return false;
 
-      newTP = NormalizeDouble(currentTP - extendAmount, digits);
+      newTP = NormalizePrice(currentTP - extendAmount);
+      if(newTP <= 0.0)
+         return false;
    }
 
-   double currentSL = PositionGetDouble(POSITION_SL);
+   if(!IsModifySafe(posType, bid, ask, currentSL, currentTP, currentSL, newTP))
+      return false;
 
-   if(trade.PositionModify(ticket, currentSL, newTP))
+   if(trade.PositionModify(ticket, currentSL, newTP) && IsModifyRetcodeSuccess(trade.ResultRetcode()))
    {
-      Print("TP Extended for ticket ", ticket, " | New TP: ", newTP, " | Extension: ", extendAmount/pipSize, " pips");
+      outNewTP = newTP;
+      Print("TP Extended for ticket ", ticket, " | New TP: ", newTP, " | Extension: ", extendAmount / pipSize, " pips");
       return true;
    }
 
+   Print("Failed to extend TP for ticket ", ticket,
+         " | Retcode: ", trade.ResultRetcode(), " (", trade.ResultRetcodeDescription(), ")");
    return false;
 }
 
@@ -530,14 +796,31 @@ int AddTrackedPosition(ulong ticket, double entryPrice, double initialTP, dateti
    int size = ArraySize(trackedPositions);
    ArrayResize(trackedPositions, size + 1);
 
-   trackedPositions[size].ticket = ticket;
-   trackedPositions[size].entryPrice = entryPrice;
-   trackedPositions[size].initialTP = initialTP;
-   trackedPositions[size].tpExtensions = 0;
-   trackedPositions[size].breakEvenSet = false;
-   trackedPositions[size].openTime = openTime;
+   bool restoredBE = false;
+   int restoredExt = 0;
 
-   Print("Now tracking position: ", ticket);
+   if(InpPersistState)
+   {
+      string beVar  = GetBEGlobalVarName(ticket);
+      string extVar = GetExtGlobalVarName(ticket);
+
+      if(GlobalVariableCheck(beVar))
+         restoredBE = (GlobalVariableGet(beVar) > 0.5);
+      if(GlobalVariableCheck(extVar))
+         restoredExt = (int)MathMax(0.0, GlobalVariableGet(extVar));
+   }
+
+   trackedPositions[size].ticket         = ticket;
+   trackedPositions[size].entryPrice     = entryPrice;
+   trackedPositions[size].initialTP      = initialTP;
+   trackedPositions[size].lastExtendedTP = initialTP;
+   trackedPositions[size].tpExtensions   = restoredExt;
+   trackedPositions[size].breakEvenSet   = restoredBE;
+   trackedPositions[size].openTime       = openTime;
+
+   Print("Now tracking position: ", ticket,
+         " | Restored BE: ", restoredBE ? "true" : "false",
+         " | Restored TP Ext: ", restoredExt);
 
    return size;
 }
@@ -549,12 +832,19 @@ void CleanupTrackedPositions()
 {
    for(int i = ArraySize(trackedPositions) - 1; i >= 0; i--)
    {
-      if(!PositionSelectByTicket(trackedPositions[i].ticket))
+      ulong ticket = trackedPositions[i].ticket;
+      if(!PositionSelectByTicket(ticket))
       {
-         // Position no longer exists, remove from tracking
-         Print("Position ", trackedPositions[i].ticket, " closed, removing from tracking");
+         // Position no longer exists, clean up persisted globals and tracking entry
+         string beVar  = GetBEGlobalVarName(ticket);
+         string extVar = GetExtGlobalVarName(ticket);
+         if(GlobalVariableCheck(beVar))
+            GlobalVariableDel(beVar);
+         if(GlobalVariableCheck(extVar))
+            GlobalVariableDel(extVar);
 
-         // Remove by shifting elements
+         Print("Position ", ticket, " closed, removing from tracking");
+
          for(int j = i; j < ArraySize(trackedPositions) - 1; j++)
          {
             trackedPositions[j] = trackedPositions[j + 1];
@@ -582,9 +872,18 @@ void DisplayDashboard()
    int lineHeight = 18;
    color textColor = clrWhite;
 
+   double bid = SymbolInfoDouble(workSymbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(workSymbol, SYMBOL_ASK);
+   double spreadPips = (bid > 0.0 && ask > 0.0 && pipSize > 0.0) ? ((ask - bid) / pipSize) : 0.0;
+   long stopsLevel = SymbolInfoInteger(workSymbol, SYMBOL_TRADE_STOPS_LEVEL);
+
    // Title
-   CreateLabel(prefix + "Title", "=== Trailing TP/SL EA ===", x, y, clrGold);
+   CreateLabel(prefix + "Title", "=== Trailing TP/SL EA v2.00 ===", x, y, clrGold);
    y += lineHeight + 5;
+
+   // Symbol
+   CreateLabel(prefix + "Symbol", "Symbol: " + workSymbol, x, y, textColor);
+   y += lineHeight;
 
    // ADX Value
    string adxText = StringFormat("ADX: %.1f", adxBuffer[0]);
@@ -594,7 +893,7 @@ void DisplayDashboard()
    y += lineHeight;
 
    // ATR Value
-   string atrText = StringFormat("ATR: %.4f", atrBuffer[0]);
+   string atrText = StringFormat("ATR: %.*f", MathMax(digits, 4), atrBuffer[0]);
    CreateLabel(prefix + "ATR", atrText, x, y, textColor);
    y += lineHeight;
 
@@ -602,6 +901,17 @@ void DisplayDashboard()
    string trendDir = plusDIBuffer[0] > minusDIBuffer[0] ? "BULLISH" : "BEARISH";
    color trendColor = plusDIBuffer[0] > minusDIBuffer[0] ? clrLime : clrRed;
    CreateLabel(prefix + "Trend", "Trend: " + trendDir, x, y, trendColor);
+   y += lineHeight;
+
+   // Spread in pips
+   string spreadText = StringFormat("Spread: %.1f pips", spreadPips);
+   color spreadColor = (InpMaxSpreadPips > 0.0 && spreadPips > InpMaxSpreadPips) ? clrOrangeRed : textColor;
+   CreateLabel(prefix + "Spread", spreadText, x, y, spreadColor);
+   y += lineHeight;
+
+   // Stops level
+   string stopsText = StringFormat("Stops Level: %d pts", stopsLevel);
+   CreateLabel(prefix + "Stops", stopsText, x, y, textColor);
    y += lineHeight;
 
    // Tracked positions count

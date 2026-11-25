@@ -1,0 +1,32 @@
+; XAGUSD Trailing TP/SL EA v2.00 - Aggressive Preset
+; Tighter trailing stops, earlier activation, lower ADX threshold, and higher TP extension cap
+InpSymbol=
+InpMagicNumber=0
+InpCheckIntervalMs=250
+InpPipSizeOverride=0.0
+InpMaxSpreadPips=8.0
+InpShowDashboard=true
+InpPersistState=true
+InpApplyInitialSLTP=true
+InpInitialSLPips=35.0
+InpInitialTPPips=120.0
+InpEnableTrailingSL=true
+InpTrailingSLStart=15.0
+InpTrailingSLDistance=10.0
+InpTrailingSLStep=3.0
+InpUseATRForSL=true
+InpEnableTrailingTP=true
+InpTPExtendThreshold=25.0
+InpTPExtendAmount=25.0
+InpMaxTPExtensions=8
+InpUseATRForTP=true
+InpUseTrendFilter=true
+InpADXPeriod=14
+InpADXThreshold=20.0
+InpStrongTrendADX=30.0
+InpATRPeriod=14
+InpATRMultiplierSL=1.2
+InpATRMultiplierTP=3.0
+InpBreakEvenPips=20.0
+InpBreakEvenOffset=1.5
+InpEnableBreakEven=true
