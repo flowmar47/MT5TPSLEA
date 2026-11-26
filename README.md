@@ -1,5 +1,7 @@
 # XAGUSD Trailing TP/SL Expert Advisor for MetaTrader 5 (v2.00)
 
+[![CI](https://github.com/flowmar47/MT5TPSLEA/actions/workflows/ci.yml/badge.svg)](https://github.com/flowmar47/MT5TPSLEA/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 An Expert Advisor for MetaTrader 5 that automatically applies and manages adaptive trailing Take Profit, trailing Stop Loss, and break-even protection on manually entered XAGUSD (Silver) or other symbol trades using ADX trend strength and ATR volatility.
 
 ## Features (v2.00)
